@@ -1809,10 +1809,13 @@ class T5Loader(ModelLoader):
         self.set_linear(spec.decoder.projection, model.lm_head)
 
         config = model.config
-        if getattr(config, "scale_decoder_outputs", config.tie_word_embeddings):
+        if self._scale_decoder_outputs(config):
             spec.decoder.scale_outputs = config.d_model**-0.5
 
         return spec
+
+    def _scale_decoder_outputs(self, config):
+        return getattr(config, "scale_decoder_outputs", config.tie_word_embeddings)
 
     def get_vocabulary(self, model, tokenizer):
         tokens = super().get_vocabulary(model, tokenizer)
@@ -1918,6 +1921,11 @@ class MT5Loader(T5Loader):
     @property
     def architecture_name(self):
         return "MT5ForConditionalGeneration"
+
+    def _scale_decoder_outputs(self, config):
+        # Transformers 5 mT5 projects the decoder output directly, even for tied weights.
+        major_version = int(transformers.__version__.split(".")[0])
+        return major_version < 5 and config.tie_word_embeddings
 
 
 @register_loader("UMT5Config")
