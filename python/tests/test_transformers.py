@@ -1564,3 +1564,85 @@ def test_t5_loader_shares_the_first_relative_attention_bias():
         assert len(biases) == 3
         # T5 only defines the table in the first layer and shares it with the others.
         assert all(bias is biases[0] for bias in biases)
+
+
+# Gemma 3 4B, 12B and 27B use linear RoPE scaling in the global layers, and 27B
+# scales the queries by query_pre_attn_scalar (168) instead of head_dim (128).
+# The 1B model has neither, so tiny random models cover these settings.
+
+
+def _build_tiny_gemma3(query_pre_attn_scalar, rope_scaling_factor):
+    import torch
+    import transformers
+
+    config = transformers.Gemma3TextConfig(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        query_pre_attn_scalar=query_pre_attn_scalar,
+        sliding_window=64,
+        layer_types=["sliding_attention", "full_attention"] * 2,
+        max_position_embeddings=128,
+    )
+    if rope_scaling_factor is not None:
+        if hasattr(config, "rope_parameters"):
+            config.rope_parameters["full_attention"] = {
+                "rope_type": "linear",
+                "factor": rope_scaling_factor,
+                "rope_theta": 1_000_000.0,
+            }
+        else:
+            config.rope_scaling = {"rope_type": "linear", "factor": rope_scaling_factor}
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    model = transformers.Gemma3ForCausalLM(config).eval()
+    # Random norm weights make the attention less uniform, so the scale matters.
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "norm" in name:
+                parameter.normal_(0, 1)
+    return model
+
+
+@test_utils.only_on_linux
+@pytest.mark.parametrize(
+    "query_pre_attn_scalar,rope_scaling_factor",
+    [(16, None), (24, None), (16, 8.0), (24, 8.0)],
+)
+def test_gemma3_logits_match_transformers(
+    tmp_dir, query_pre_attn_scalar, rope_scaling_factor
+):
+    import torch
+
+    from ctranslate2.converters.transformers import Gemma3Loader
+
+    model = _build_tiny_gemma3(query_pre_attn_scalar, rope_scaling_factor)
+
+    ids = [2] + [(7 * i + 3) % 60 + 4 for i in range(39)]
+    # The loader removes the attention modules, so the reference comes first.
+    with torch.no_grad():
+        expected = model(input_ids=torch.tensor([ids])).logits[0].numpy()
+
+    loader = Gemma3Loader()
+    spec = loader.get_model_spec(model)
+    tokens = ["<pad>", "<eos>", "<bos>", "<unk>"] + [
+        "tok%d" % i for i in range(4, model.config.vocab_size)
+    ]
+    loader.set_vocabulary(spec, tokens)
+    spec.config.bos_token = "<bos>"
+    spec.config.eos_token = "<eos>"
+    spec.config.unk_token = "<unk>"
+    spec.validate()
+    spec.optimize(quantization="float32")
+    output_dir = str(tmp_dir.join("model"))
+    os.makedirs(output_dir, exist_ok=True)
+    spec.save(output_dir)
+
+    generator = ctranslate2.Generator(output_dir, device="cpu")
+    got = np.array(generator.forward_batch([[tokens[i] for i in ids]]))[0]
+
+    np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
