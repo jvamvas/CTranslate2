@@ -1808,8 +1808,9 @@ class T5Loader(ModelLoader):
         self.set_stack(spec.decoder, model.decoder, is_decoder=True)
         self.set_linear(spec.decoder.projection, model.lm_head)
 
-        if model.config.tie_word_embeddings:
-            spec.decoder.scale_outputs = model.config.d_model**-0.5
+        config = model.config
+        if getattr(config, "scale_decoder_outputs", config.tie_word_embeddings):
+            spec.decoder.scale_outputs = config.d_model**-0.5
 
         return spec
 
